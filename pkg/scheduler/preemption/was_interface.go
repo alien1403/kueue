@@ -53,3 +53,43 @@ func GetCandidatesUpfront(provider CandidateProvider, allowBorrowing bool) Candi
 	}
 	return list
 }
+
+type classicalStrategy struct {
+	provider   CandidateProvider
+	attempts   []bool // allowBorrowing options to try
+	currentIdx int
+	lastResult bool
+}
+
+// NewClassicalStrategy creates a Strategy implementation for Classical preemption
+func NewClassicalStrategy(provider CandidateProvider, attemptOptions []bool) Strategy {
+	return &classicalStrategy{
+		provider: provider,
+		attempts: attemptOptions,
+	}
+}
+
+func (s *classicalStrategy) CandidateSets() iter.Seq[CandidateList] {
+	return func(yield func(CandidateList) bool) {
+		for s.currentIdx < len(s.attempts) && !s.lastResult {
+			idxBeforeYield := s.currentIdx
+			allowBorrowing := s.attempts[s.currentIdx]
+			candidates := GetCandidatesUpfront(s.provider, allowBorrowing)
+			if !yield(candidates) {
+				return
+			}
+			if s.currentIdx == idxBeforeYield {
+				s.currentIdx++
+			}
+		}
+	}
+}
+
+func (s *classicalStrategy) ReportResult(success bool) {
+	s.lastResult = success
+	s.currentIdx++
+}
+
+func (s *classicalStrategy) ShouldContinue() bool {
+	return !s.lastResult && s.currentIdx < len(s.attempts)
+}

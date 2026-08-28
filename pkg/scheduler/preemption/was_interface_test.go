@@ -81,7 +81,7 @@ func TestStrategyInterface(t *testing.T) {
 	for candidateList := range strategy.CandidateSets() {
 		setsCollected++
 		if setsCollected == 1 && len(candidateList) != 1 {
-			t.Fatalf("expected 1 candidate in first setm got %d", len(candidateList))
+			t.Fatalf("expected 1 candidate in first set, got %d", len(candidateList))
 		}
 	}
 
@@ -95,7 +95,7 @@ func TestStrategyInterface(t *testing.T) {
 	}
 }
 
-func TestGetCandidateUpfront(t *testing.T) {
+func TestGetCandidatesUpfront(t *testing.T) {
 	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns").Obj())
 	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns").Obj())
 
@@ -110,5 +110,39 @@ func TestGetCandidateUpfront(t *testing.T) {
 
 	if list[0].Obj.Name != "wl1" || list[1].Obj.Name != "wl2" {
 		t.Fatalf("unexpected candidate order")
+	}
+}
+
+func TestClassicalStrategy(t *testing.T) {
+	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns").Obj())
+	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns").Obj())
+
+	provider := &mockCandidateProvider{
+		candidates: []*workload.Info{wl1, wl2},
+	}
+
+	// Classical strategy trying allowBorrowing without preemption first
+	strategy := NewClassicalStrategy(provider, []bool{true, false})
+
+	attemptsExecuted := 0
+	for candidateList := range strategy.CandidateSets() {
+		attemptsExecuted++
+		if len(candidateList) != 2 {
+			t.Fatalf("expected 2 candidates, got %d", len(candidateList))
+		}
+		// first attempt fails, second attempt succeeds
+		if attemptsExecuted == 1 {
+			strategy.ReportResult(false)
+		} else {
+			strategy.ReportResult(true)
+		}
+	}
+
+	if attemptsExecuted != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attemptsExecuted)
+	}
+
+	if strategy.ShouldContinue() {
+		t.Fatalf("expected strategy to stop after successful preemption")
 	}
 }
