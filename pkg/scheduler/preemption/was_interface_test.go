@@ -20,6 +20,9 @@ import (
 	"iter"
 	"testing"
 
+	"github.com/go-logr/logr"
+
+	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
@@ -140,6 +143,38 @@ func TestClassicalStrategy(t *testing.T) {
 
 	if attemptsExecuted != 2 {
 		t.Fatalf("expected 2 attempts, got %d", attemptsExecuted)
+	}
+
+	if strategy.ShouldContinue() {
+		t.Fatalf("expected strategy to stop after successful preemption")
+	}
+}
+
+func TestFairSharingStrategy(t *testing.T) {
+	fixture := newFsLogFixture(t, logr.Discard(), []fsLogClusterQueue{
+		{name: "b", candidates: 5},
+		{name: "c", candidates: 5},
+	})
+
+	strategies := []fairsharing.Strategy{
+		fairsharing.LessThanOrEqualToFinalShare,
+		fairsharing.LessThanInitialShare,
+	}
+
+	strategy := NewFairSharingStrategy(fixture.preemptionCtx, fixture.candidates, strategies)
+
+	setsRun := 0
+	for candidateList := range strategy.CandidateSets() {
+		setsRun++
+		if len(candidateList) == 0 {
+			t.Fatalf("expected non-empty candidate list")
+		}
+		strategy.ReportResult(true)
+		break
+	}
+
+	if setsRun == 0 {
+		t.Fatalf("expected at least 1 candidate set from fairSharingStrategy")
 	}
 
 	if strategy.ShouldContinue() {
