@@ -691,7 +691,11 @@ func TestUpdateConfig(t *testing.T) {
 
 			adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
 			recorder := &utiltesting.EventRecorder{}
-			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, tc.cpAccessProvider, nil, recorder, nil)
+			reconciler := newClustersReconciler(c, TestNamespace,
+				withAdapters(adapters),
+				withClusterProfileAccessProvider(tc.cpAccessProvider),
+				withEventRecorder(recorder),
+			)
 
 			reconciler.rootContext = ctx
 
@@ -867,7 +871,11 @@ func TestReconnectBackoff(t *testing.T) {
 
 			adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
 			recorder := &utiltesting.EventRecorder{}
-			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, &testClusterProfileAccessProvider{}, nil, recorder, nil)
+			reconciler := newClustersReconciler(c, TestNamespace,
+				withAdapters(adapters),
+				withClusterProfileAccessProvider(&testClusterProfileAccessProvider{}),
+				withEventRecorder(recorder),
+			)
 			reconciler.rootContext = ctx
 
 			var buildCalls int
@@ -924,7 +932,11 @@ func TestDisconnectedClientReconnectsWithSameConfig(t *testing.T) {
 
 	adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
 	recorder := &utiltesting.EventRecorder{}
-	reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, &testClusterProfileAccessProvider{}, nil, recorder, nil)
+	reconciler := newClustersReconciler(c, TestNamespace,
+		withAdapters(adapters),
+		withClusterProfileAccessProvider(&testClusterProfileAccessProvider{}),
+		withEventRecorder(recorder),
+	)
 	reconciler.rootContext = ctx
 
 	var buildCalls int
@@ -1003,7 +1015,7 @@ func TestActiveConditionSurfacesBackoff(t *testing.T) {
 	managerClient := getClientBuilder(ctx).WithObjects(cluster).WithStatusSubresource(cluster).Build()
 	adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
 	recorder := &utiltesting.EventRecorder{}
-	cRec := newClustersReconciler(managerClient, TestNamespace, 0, defaultOrigin, nil, adapters, &NoOpClusterProfileAccessProvider{}, nil, recorder, nil)
+	cRec := newClustersReconciler(managerClient, TestNamespace, withAdapters(adapters), withEventRecorder(recorder))
 
 	nextRetry := time.Now().Truncate(time.Second).Add(20 * time.Second)
 	rc := newRemoteClient(managerClient, nil, nil, nil, defaultOrigin, "", adapters)
@@ -1338,7 +1350,7 @@ func TestClustersReconcilerEventFilters(t *testing.T) {
 			ctx, _ := utiltesting.ContextWithLog(t)
 			c := getClientBuilder(ctx).Build()
 			recorder := &utiltesting.EventRecorder{}
-			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, newKubeConfigFSWatcher(), nil, &NoOpClusterProfileAccessProvider{}, nil, recorder, nil)
+			reconciler := newClustersReconciler(c, TestNamespace, withFSWatcher(newKubeConfigFSWatcher()), withEventRecorder(recorder))
 			reconciler.rootContext = ctx
 
 			if got := tc.invoke(reconciler); got != tc.wantReconcile {
@@ -1588,7 +1600,7 @@ func TestSetRemoteClientConfigDoesNotBlockOtherClusters(t *testing.T) {
 		Build()
 
 	recorder := &utiltesting.EventRecorder{}
-	reconciler := newClustersReconciler(localClient, TestNamespace, 0, defaultOrigin, nil, nil, &NoOpClusterProfileAccessProvider{}, nil, recorder, nil)
+	reconciler := newClustersReconciler(localClient, TestNamespace, withEventRecorder(recorder))
 	reconciler.rootContext = ctx
 	reconciler.builderOverride = gatedBuilder
 	t.Cleanup(func() {
@@ -1977,7 +1989,11 @@ func TestClustersReconcilerWorkerClientConstruction(t *testing.T) {
 				Build()
 
 			adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
-			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, &NoOpClusterProfileAccessProvider{}, nil, &utiltesting.EventRecorder{}, tc.clientConn)
+			reconciler := newClustersReconciler(c, TestNamespace,
+				withAdapters(adapters),
+				withEventRecorder(&utiltesting.EventRecorder{}),
+				withClientConnection(tc.clientConn),
+			)
 			reconciler.rootContext = ctx
 
 			var constructedRESTConfig *rest.Config
@@ -2016,7 +2032,10 @@ func TestStopAndRemoveClusterClearsStatusMetric(t *testing.T) {
 
 	ctx, _ := utiltesting.ContextWithLog(t)
 	adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
-	reconciler := newClustersReconciler(getClientBuilder(ctx).Build(), TestNamespace, 0, defaultOrigin, nil, adapters, nil, nil, &utiltesting.EventRecorder{}, nil)
+	reconciler := newClustersReconciler(getClientBuilder(ctx).Build(), TestNamespace,
+		withAdapters(adapters),
+		withEventRecorder(&utiltesting.EventRecorder{}),
+	)
 
 	// The same ClusterQueue references both workers.
 	metrics.ReportMultiKueueClusterStatus("cq1", "worker1", metav1.ConditionTrue, nil)
