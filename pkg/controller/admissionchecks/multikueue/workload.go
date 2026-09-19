@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -256,11 +257,25 @@ func (w *wlReconciler) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	if isDeleted {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var delErr error
 		for cluster := range grp.remotes {
-			err := grp.RemoveRemoteObjects(ctx, cluster)
-			if err != nil {
-				return reconcile.Result{}, err
-			}
+			wg.Add(1)
+			go func(cl string) {
+				defer wg.Done()
+				if err := grp.RemoveRemoteObjects(ctx, cl); err != nil {
+					mu.Lock()
+					if delErr == nil {
+						delErr = err
+					}
+					mu.Unlock()
+				}
+			}(cluster)
+		}
+		wg.Wait()
+		if delErr != nil {
+			return reconcile.Result{}, delErr
 		}
 		// Remote workloads on unavailable clusters will be cleaned up by
 		// the per-cluster GC once the cluster reconnects.
@@ -349,16 +364,36 @@ func (w *wlReconciler) readGroup(ctx context.Context, local *kueue.Workload, acN
 		unavailableClusters: unavailable,
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
 	for remote, rClient := range rClients {
-		wl := &kueue.Workload{}
-		err := rClient.getClient().Get(ctx, client.ObjectKeyFromObject(local), wl)
-		if client.IgnoreNotFound(err) != nil {
-			return nil, err
-		}
-		if err != nil {
-			wl = nil
-		}
-		grp.remotes[remote] = wl
+		wg.Add(1)
+		go func(rem string, cl *remoteClient) {
+			defer wg.Done()
+			wl := &kueue.Workload{}
+			getErr := cl.getClient().Get(ctx, client.ObjectKeyFromObject(local), wl)
+			if client.IgnoreNotFound(getErr) != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = getErr
+				}
+				mu.Unlock()
+				return
+			}
+			if getErr != nil {
+				wl = nil
+			}
+			mu.Lock()
+			grp.remotes[rem] = wl
+			mu.Unlock()
+		}(remote, rClient)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return &grp, nil
 }
@@ -381,12 +416,21 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 	// 2. Delete all remote workloads when the local workload is finished or has no quota reservation.
 	if group.IsFinished() || !workload.HasQuotaReservation(group.local) {
 		var errs []error
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 		for rem := range group.remotes {
-			if err := group.RemoveRemoteObjects(ctx, rem); err != nil {
-				errs = append(errs, err)
-				log.V(2).Error(err, "Deleting remote workload", "workerCluster", rem)
-			}
+			wg.Add(1)
+			go func(rem string) {
+				defer wg.Done()
+				if err := group.RemoveRemoteObjects(ctx, rem); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+					log.V(2).Error(err, "Deleting remote workload", "workerCluster", rem)
+				}
+			}(rem)
 		}
+		wg.Wait()
 		if len(group.unavailableClusters) > 0 {
 			log.V(3).Info("Retrying remote workload cleanup, some clusters are unavailable", "unavailableClusters", group.unavailableClusters, "retryAfter", w.workerLostTimeout)
 			return reconcile.Result{RequeueAfter: w.workerLostTimeout}, errors.Join(errs...)
@@ -575,14 +619,32 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 	// 6b. An admitting remote is visible: converge onto it.
 	if remoteCond != nil {
 		// remove the non-selected worker workloads
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var remErr error
 		for rem, remWl := range group.remotes {
 			if remWl != nil && rem != admittingRemote {
-				if err := client.IgnoreNotFound(group.RemoveRemoteObjects(ctx, rem)); err != nil {
-					log.V(2).Error(err, "Deleting out of sync remote objects", "remote", rem)
-					return reconcile.Result{}, err
+				wg.Add(1)
+				go func(rem string) {
+					defer wg.Done()
+					if err := client.IgnoreNotFound(group.RemoveRemoteObjects(ctx, rem)); err != nil {
+						log.V(2).Error(err, "Deleting out of sync remote objects", "remote", rem)
+						mu.Lock()
+					if remErr == nil {
+						remErr = err
+					}
+					mu.Unlock()
+					return
 				}
+				mu.Lock()
 				group.remotes[rem] = nil
-			}
+				mu.Unlock()
+			}(rem)
+		}
+		}
+		wg.Wait()
+		if remErr != nil {
+			return reconcile.Result{}, remErr
 		}
 
 		remoteCl := group.remoteClients[admittingRemote].getClient()
@@ -938,25 +1000,43 @@ func (w *wlReconciler) nominateAndSynchronizeWorkers(ctx context.Context, group 
 
 	log.V(4).Info("Synchronize nominated worker clusters", "dispatcherName", w.dispatcherName, "nominatedWorkerClusterNames", nominatedWorkers)
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for rem, remoteWl := range group.remotes {
 		if slices.Contains(nominatedWorkers, rem) {
 			if remoteWl == nil {
-				clone := cloneForCreate(group.local, group.remoteClients[rem].origin, true)
-				if err := group.remoteClients[rem].getClient().Create(ctx, clone); err != nil {
-					log.V(2).Error(err, "creating remote object", "remote", rem)
-					errs = append(errs, err)
-				} else {
-					metrics.ReportMultiKueueWorkloadDispatched(admittedClusterQueue(group.local), rem, w.roleTracker)
-				}
+				wg.Add(1)
+				go func(rem string) {
+					defer wg.Done()
+					clone := cloneForCreate(group.local, group.remoteClients[rem].origin, true)
+					if err := group.remoteClients[rem].getClient().Create(ctx, clone); err != nil {
+						log.V(2).Error(err, "creating remote object", "remote", rem)
+						mu.Lock()
+						errs = append(errs, err)
+						mu.Unlock()
+					} else {
+						metrics.ReportMultiKueueWorkloadDispatched(admittedClusterQueue(group.local), rem, w.roleTracker)
+					}
+				}(rem)
 			}
 		} else if remoteWl != nil {
-			if err := client.IgnoreNotFound(group.RemoveRemoteObjects(ctx, rem)); err != nil {
-				log.V(2).Error(err, "removing non-nominated remote object", "remote", rem)
-				errs = append(errs, err)
-			}
-			group.remotes[rem] = nil
+			wg.Add(1)
+			go func(rem string) {
+				defer wg.Done()
+				if err := client.IgnoreNotFound(group.RemoveRemoteObjects(ctx, rem)); err != nil {
+					log.V(2).Error(err, "removing non-nominated remote object", "remote", rem)
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
+				mu.Lock()
+				group.remotes[rem] = nil
+				mu.Unlock()
+			}(rem)
 		}
 	}
+	wg.Wait()
 	return reconcile.Result{}, errors.Join(errs...)
 }
 
