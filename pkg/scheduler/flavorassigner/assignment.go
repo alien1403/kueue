@@ -427,6 +427,13 @@ func NewStatus(reasons ...string) *Status {
 	}
 }
 
+func NewErrorStatus(err error, reasons []string) *Status {
+	return &Status{
+		reasons: reasons,
+		err:     err,
+	}
+}
+
 func (s *Status) IsFit() bool {
 	return s == nil || (s.err == nil && len(s.reasons) == 0)
 }
