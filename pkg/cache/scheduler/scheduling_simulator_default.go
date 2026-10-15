@@ -32,6 +32,8 @@ import (
 	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
 	"sigs.k8s.io/kueue/pkg/features"
 	utiltaints "sigs.k8s.io/kueue/pkg/util/taints"
+
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 )
 
 type defaultSimulatorFactory struct{}
@@ -133,4 +135,8 @@ func (s *defaultSimulator) Simulate(_ context.Context, fn func()) error {
 
 func (s *defaultSimulator) ScheduleWorkload(_ context.Context, workloadPods []*corev1.Pod, _ ...simulator.ScheduleOption) simulator.SchedulingResult {
 	return simulator.SchedulingResult{Error: errors.ErrUnsupported}
+}
+
+func (s *defaultSimulator) AddPodGroup(_ context.Context, _ *schedulingv1beta1.PodGroup) error {
+	return nil
 }

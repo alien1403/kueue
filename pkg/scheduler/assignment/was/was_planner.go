@@ -28,6 +28,7 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	schedcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
+	wassched "sigs.k8s.io/kueue/pkg/cache/scheduler/was"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/scheduler/assignment"
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
@@ -72,8 +73,16 @@ func (p *wasPlanner) Plan(ctx context.Context, initialAssignment *flavorassigner
 		return
 	}
 
-	// ScheduleWorkload will always return a failed result here for wasScheduler,
-	// until Virtual Pod Groups are implemented and added to the ClusterSnapshot.
+	vPg, err := wassched.BuildVirtualPodGroup(p.wl.Obj)
+	if err != nil {
+		plan.Error = fmt.Errorf("failed to build virtual pod group: %w", err)
+		return
+	}
+	if err := p.snapshot.SchedulerSimulator.AddPodGroup(ctx, vPg); err != nil {
+		plan.Error = fmt.Errorf("failed to add virtual pod group to simulator: %w", err)
+		return
+	}
+
 	schedulingResult := p.snapshot.SchedulerSimulator.ScheduleWorkload(ctx, pods)
 	if schedulingResult.Error != nil {
 		plan.Error = fmt.Errorf("failed to schedule workload: %w", schedulingResult.Error)

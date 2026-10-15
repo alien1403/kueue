@@ -373,24 +373,25 @@ test-e2e-was-tas-extended-helm: test-tas-e2e-extended-helm
 
 # WAS deep integration version of TAS e2e tests
 .PHONY: test-e2e-was-deep-tas-baseline
-test-e2e-was-deep-tas-baseline: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-baseline: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true,GenericWorkload=true
 test-e2e-was-deep-tas-baseline: test-tas-e2e-baseline
 
 .PHONY: test-e2e-was-deep-tas-baseline-basic-fit
-test-e2e-was-deep-tas-baseline-basic-fit: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-baseline-basic-fit: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true,GenericWorkload=true
 test-e2e-was-deep-tas-baseline-basic-fit: GINKGO_ARGS=--label-filter="feature:tas-basic-fit"
+test-e2e-was-deep-tas-baseline-basic-fit: WAS_ENABLED=true
 test-e2e-was-deep-tas-baseline-basic-fit: test-tas-e2e-baseline
 
 .PHONY: test-e2e-was-deep-tas-extended
-test-e2e-was-deep-tas-extended: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-extended: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true,GenericWorkload=true
 test-e2e-was-deep-tas-extended: test-tas-e2e-extended
 
 .PHONY: test-e2e-was-deep-tas-extended-shard-0
-test-e2e-was-deep-tas-extended-shard-0: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-extended-shard-0: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true,GenericWorkload=true
 test-e2e-was-deep-tas-extended-shard-0: test-tas-e2e-extended-shard-0
 
 .PHONY: test-e2e-was-deep-tas-extended-shard-1
-test-e2e-was-deep-tas-extended-shard-1: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-extended-shard-1: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true,GenericWorkload=true
 test-e2e-was-deep-tas-extended-shard-1: test-tas-e2e-extended-shard-1
 
 # Backwards compatibility aliases for CI/Prow
