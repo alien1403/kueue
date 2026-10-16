@@ -19,5 +19,5 @@ package deepintegration
 const (
 	instanceType      = "tas-group"
 	tasNodeGroupLabel = "cloud.provider.com/node-group"
-	extraResource      = "example.com/gpu"
+	extraResource     = "example.com/gpu"
 )

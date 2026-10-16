@@ -20,9 +20,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +37,9 @@ import (
 	"sigs.k8s.io/kueue/test/util/behavioral"
 	"sigs.k8s.io/kueue/test/util/behavioral/e2e"
 )
+
+// TODO: Replace with kueue.WorkloadQuotaReservedReasonSimulationFailed once #16483 is merged
+const workloadQuotaReservedReasonSimulationFailed = "SchedulingSimulationFailed"
 
 var _ = ginkgo.Describe("TopologyAwareScheduling Basic Fit and Quota", ginkgo.Label(e2e.Shard1, "area:tas", "feature:tas-basic-fit"), func() {
 	var (
@@ -319,10 +324,12 @@ func expectPodsScheduledAndRunning(ctx context.Context, k8sClient client.Client,
 }
 
 func expectQuotaReservedFailure(g gomega.Gomega, wl *kueue.Workload) {
-	g.Expect(wl.Status.Conditions).To(gomega.ContainElement(gomega.And(
-		gomega.HaveField("Type", kueue.WorkloadQuotaReserved),
-		gomega.HaveField("Status", metav1.ConditionFalse),
-		gomega.HaveField("Reason", kueue.WorkloadQuotaReservedReasonSimulationFailed),
-		gomega.HaveField("Message", gomega.ContainSubstring("Insufficient")),
-	)))
+	cond := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved)
+	g.Expect(cond).ShouldNot(gomega.BeNil())
+	g.Expect(cond).Should(gomega.BeComparableTo(&metav1.Condition{
+		Type:   kueue.WorkloadQuotaReserved,
+		Status: metav1.ConditionFalse,
+		Reason: workloadQuotaReservedReasonSimulationFailed,
+	}, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "Message", "ObservedGeneration")))
+	g.Expect(cond.Message).Should(gomega.ContainSubstring("Insufficient"))
 }

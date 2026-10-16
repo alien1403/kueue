@@ -373,7 +373,8 @@ test-e2e-was-tas-extended-helm: test-tas-e2e-extended-helm
 
 # WAS deep integration version of TAS e2e tests
 .PHONY: test-e2e-was-deep-tas-baseline
-test-e2e-was-deep-tas-baseline: test-tas-e2e-deepintegration
+test-e2e-was-deep-tas-baseline: E2E_EXTRA_KUEUE_FEATURE_GATES=SchedulerLibraryIntegration=true,SchedulerLibraryDeepIntegration=true
+test-e2e-was-deep-tas-baseline: test-tas-e2e-baseline
 
 .PHONY: test-e2e-was-deep-tas-baseline-basic-fit
 test-e2e-was-deep-tas-baseline-basic-fit: GINKGO_ARGS=--label-filter="feature:tas-basic-fit"
