@@ -55,8 +55,9 @@ var (
 
 	metricsPort = flag.Int("metricsPort", 0, "metrics serving port")
 
-	enableTAS = flag.Bool("enableTAS", false, "enable TAS controllers and indexers")
-	enableDRA = flag.Bool("enableDRA", false, "enable the DRA device feasibility check and map the generated DeviceClass to quota")
+	enableTAS     = flag.Bool("enableTAS", false, "enable TAS controllers and indexers")
+	enableDRA     = flag.Bool("enableDRA", false, "enable the DRA device feasibility check and map the generated DeviceClass to quota")
+	enableDeepWAS = flag.Bool("enableDeepWAS", false, "enable DeepWAS integration and required Kubernetes feature gates")
 
 	qps                 = flag.Float64("qps", 50, "Kubernetes client QPS")
 	burst               = flag.Int("burst", 100, "Kubernetes client burst")
@@ -202,6 +203,19 @@ func run() int {
 			return 1
 		}
 		cfg.Resources = &configapi.Resources{DeviceClassMappings: controllers.DRADeviceClassMappings()}
+	}
+	if *enableDeepWAS {
+		if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{
+			string(features.SchedulerLibraryIntegration):     true,
+			string(features.SchedulerLibraryDeepIntegration): true,
+			"GenericWorkload":                                true,
+			"CompositePodGroup":                              true,
+			"TopologyAwareWorkloadScheduling":                true,
+		}); err != nil {
+			log.Error(err, "Unable to enable DeepWAS feature gates")
+			return 1
+		}
+		log.Info("Enabled DeepWAS feature gates")
 	}
 
 	if err := controllers.Setup(ctx, mgr, cfg, *enableTAS); err != nil {
