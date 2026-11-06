@@ -1,0 +1,107 @@
+# TAS High-Preemption Performance Test Configuration (Scenario 2: Ample Node Capacity)
+#
+# Designed to compare Classic Kueue TAS vs DeepWAS integration when preemptions
+# are driven by CQ/cohort quota contention across 2,560 TAS workloads.
+#
+# Uses only DeepWAS-supported TAS constraints:
+# - "required" (PodGroup with TopologyConstraint)
+# - "balanced" with sliceSize (CompositePodGroup + sliced leaf PodGroups)
+
+topology:
+  name: "default-topology"
+  levels:
+    - name: block
+      count: 1
+      nodeLabel: "cloud.provider.com/topology-block"
+    - name: rack
+      count: 8
+      nodeLabel: "cloud.provider.com/topology-rack"
+    - name: node
+      count: 6
+      nodeLabel: "kubernetes.io/hostname"
+      capacity:
+        cpu: "96"
+        memory: "256Gi"
+
+resourceFlavor:
+  name: "tas-flavor"
+  nodeLabel: "tas-node-group"
+  topologyName: "default-topology"
+
+cohorts:
+  - className: cohort
+    count: 4
+    queuesSets:
+    - className: cq
+      count: 4
+      nominalQuota: "20"
+      borrowingLimit: "40"
+      reclaimWithinCohort: Any
+      withinClusterQueue: LowerPriority
+      workloadsSets:
+      # Low-priority stream: rapidly fills CQs and borrows across cohort
+      # 2 pods × 2000m = 4 CPU per workload
+      - count: 50
+        initialDelayMs: 0
+        creationIntervalMs: 150
+        workloads:
+        - className: small-required-rack
+          runtimeMs: 800
+          priority: 50
+          request: "2000m"
+          podCount: 2
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+        - className: small-balanced-rack
+          runtimeMs: 800
+          priority: 50
+          request: "2000m"
+          podCount: 2
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 1
+
+      # Medium-priority stream: preempts running small workloads
+      # 4 pods × 2000m = 8 CPU per workload
+      - count: 20
+        initialDelayMs: 400
+        creationIntervalMs: 450
+        workloads:
+        - className: medium-required-rack
+          runtimeMs: 600
+          priority: 100
+          request: "2000m"
+          podCount: 4
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+        - className: medium-balanced-rack
+          runtimeMs: 600
+          priority: 100
+          request: "2000m"
+          podCount: 4
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 2
+
+      # High-priority burst stream: preempts running small & medium workloads,
+      # finishes quickly (300ms) so low/medium workloads refill the queue before the next burst.
+      # 8 pods × 2500m = 20 CPU per workload
+      - count: 10
+        initialDelayMs: 900
+        creationIntervalMs: 1100
+        workloads:
+        - className: large-required-rack
+          runtimeMs: 300
+          priority: 200
+          request: "2500m"
+          podCount: 8
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+        - className: large-balanced-rack
+          runtimeMs: 300
+          priority: 200
+          request: "2500m"
+          podCount: 8
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 4
