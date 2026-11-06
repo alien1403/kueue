@@ -1,0 +1,124 @@
+# TAS Heavy-Preemption 1-ClusterQueue Performance Test Configuration (Tight 8 CPU/node)
+#
+# Single ClusterQueue (1 Cohort × 1 CQ) with tight 8 CPU/node capacity:
+# - small workloads have runtimeMs: 3500 so they hold the 80 CPU quota continuously
+#   until preempted by arriving medium (prio 100) and large (prio 200) waves.
+# - Every medium (8 CPU) arrival preempts 2 small (4 CPU) workloads, and every
+#   large (20 CPU) arrival preempts up to 5 small (or medium+small) workloads,
+#   generating hundreds of preemptions inside a single ClusterQueue with zero
+#   cross-CQ nomination overlap.
+
+topology:
+  name: "default-topology"
+  levels:
+    - name: block
+      count: 1
+      nodeLabel: "cloud.provider.com/topology-block"
+    - name: rack
+      count: 2
+      nodeLabel: "cloud.provider.com/topology-rack"
+    - name: node
+      count: 6
+      nodeLabel: "kubernetes.io/hostname"
+      capacity:
+        cpu: "8"
+        memory: "64Gi"
+
+resourceFlavor:
+  name: "tas-flavor"
+  nodeLabel: "tas-node-group"
+  topologyName: "default-topology"
+
+cohorts:
+  - className: cohort
+    count: 1
+    queuesSets:
+    - className: cq
+      count: 1
+      nominalQuota: "80"
+      borrowingLimit: "0"
+      reclaimWithinCohort: Never
+      withinClusterQueue: LowerPriority
+      workloadsSets:
+      # Low-priority stream (priority 50): 2 pods × 2000m = 4 CPU per workload
+      # Long runtime (3500ms) keeps the 80 CPU CQ saturated so medium/large must preempt
+      - count: 100
+        initialDelayMs: 0
+        creationIntervalMs: 120
+        workloads:
+        - className: small-required-rack
+          runtimeMs: 3500
+          priority: 50
+          request: "2000m"
+          podCount: 2
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+
+      - count: 100
+        initialDelayMs: 60
+        creationIntervalMs: 120
+        workloads:
+        - className: small-balanced-rack
+          runtimeMs: 3500
+          priority: 50
+          request: "2000m"
+          podCount: 2
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 1
+
+      # Medium-priority stream (priority 100): 4 pods × 2000m = 8 CPU per workload
+      # Short runtime (350ms) so after preempting small workloads, it finishes quickly
+      # and lets small workloads refill before the next wave
+      - count: 45
+        initialDelayMs: 600
+        creationIntervalMs: 450
+        workloads:
+        - className: medium-required-rack
+          runtimeMs: 350
+          priority: 100
+          request: "2000m"
+          podCount: 4
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+
+      - count: 45
+        initialDelayMs: 825
+        creationIntervalMs: 450
+        workloads:
+        - className: medium-balanced-rack
+          runtimeMs: 350
+          priority: 100
+          request: "2000m"
+          podCount: 4
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 2
+
+      # High-priority burst stream (priority 200): 8 pods × 2500m = 20 CPU per workload
+      # Short runtime (250ms) so it preempts 20 CPU of running small/medium workloads,
+      # finishes quickly, and allows small/medium to refill
+      - count: 25
+        initialDelayMs: 1000
+        creationIntervalMs: 800
+        workloads:
+        - className: large-required-rack
+          runtimeMs: 250
+          priority: 200
+          request: "2500m"
+          podCount: 8
+          tasConstraint: "required"
+          tasLevel: "cloud.provider.com/topology-rack"
+
+      - count: 25
+        initialDelayMs: 1400
+        creationIntervalMs: 800
+        workloads:
+        - className: large-balanced-rack
+          runtimeMs: 250
+          priority: 200
+          request: "2500m"
+          podCount: 8
+          tasConstraint: "balanced"
+          tasLevel: "cloud.provider.com/topology-rack"
+          sliceSize: 4
