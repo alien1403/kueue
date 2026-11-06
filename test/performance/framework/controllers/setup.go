@@ -26,6 +26,7 @@ import (
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
@@ -86,6 +87,14 @@ func Setup(ctx context.Context, mgr manager.Manager, cfg *configapi.Configuratio
 				return fmt.Errorf("setup ResourceSlice indexer: %w", err)
 			}
 		}
+	}
+
+	if features.Enabled(features.SchedulerLibraryIntegration) {
+		simulatorFactory, err := was.NewWASSimulatorFactory(ctx, mgr.GetConfig())
+		if err != nil {
+			return fmt.Errorf("init WAS simulator factory: %w", err)
+		}
+		cacheOptions = append(cacheOptions, schdcache.WithSimulatorFactory(simulatorFactory))
 	}
 
 	schedulerCache := schdcache.New(mgr.GetClient(), cacheOptions...)
