@@ -12,6 +12,7 @@
 | [kep-review](kep-review/SKILL.md) | Reviewing new or updated Kueue enhancement proposals (KEPs). |
 | [kep-writing](kep-writing/SKILL.md) | "write a KEP", "update this KEP", "make this KEP easier to review", before opening or pushing a KEP PR |
 | [was-cluster](was-cluster/SKILL.md) | "set up WAS cluster", "build WAS kind cluster", "run WAS e2e tests", "tear down WAS cluster", Workload-Aware Scheduling cluster management |
+| [was-tas-preemption-perf](was-tas-preemption-perf/SKILL.md) | "run TAS preemption benchmarks", "compare Classic TAS vs DeepWAS performance", "run single-cycle preemption test", TAS/WAS scheduler performance benchmarking |
 | [kueue-e2e-cluster-singlecluster](kueue-e2e-cluster-singlecluster/SKILL.md) | "spin up an e2e cluster", "get a kind cluster ready for e2e", single-cluster e2e suite setup (baseline, extended, sequential, TAS, cert-manager, DRA) |
 | [kueue-e2e-cluster-multikueue](kueue-e2e-cluster-multikueue/SKILL.md) | "spin up MultiKueue e2e clusters", "set up manager/worker kind clusters", MultiKueue e2e suite setup (baseline, extended, sequential, DRA) |
 | [reviewer/](reviewer/README.md) | "review this PR", "review this code", "evaluate this diff", "score these commits", "review the changes between", "code quality evaluation", any code review of kueue changes |
@@ -45,6 +46,8 @@
 @kep-writing/SKILL.md
 
 @was-cluster/SKILL.md
+
+@was-tas-preemption-perf/SKILL.md
 
 @kueue-e2e-cluster-singlecluster/SKILL.md
 
