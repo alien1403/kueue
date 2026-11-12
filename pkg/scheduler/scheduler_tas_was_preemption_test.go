@@ -247,9 +247,9 @@ func setDeterministicFeatureGates(tb testing.TB, enableDeepWAS bool) {
 		string(features.TopologyAwareScheduling):         true,
 		string(features.SchedulerLibraryIntegration):     enableDeepWAS,
 		string(features.SchedulerLibraryDeepIntegration): enableDeepWAS,
-		"GenericWorkload":                                enableDeepWAS,
-		"CompositePodGroup":                              enableDeepWAS,
-		"TopologyAwareWorkloadScheduling":                enableDeepWAS,
+		"GenericWorkload":                 enableDeepWAS,
+		"CompositePodGroup":               enableDeepWAS,
+		"TopologyAwareWorkloadScheduling": enableDeepWAS,
 	}); err != nil {
 		tb.Fatalf("setting feature gates: %v", err)
 	}
@@ -262,11 +262,12 @@ func setDeterministicFeatureGates(tb testing.TB, enableDeepWAS bool) {
 }
 
 type deterministicCycleMetrics struct {
-	snapshotDuration   time.Duration
-	nominationDuration time.Duration
-	decisionDuration   time.Duration
-	preemptedCount     int
-	admitted           bool
+	coldSnapshotDuration time.Duration
+	snapshotDuration     time.Duration
+	nominationDuration   time.Duration
+	decisionDuration     time.Duration
+	preemptedCount       int
+	admitted             bool
 }
 
 func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, enableDeepWAS bool) deterministicCycleMetrics {
@@ -351,6 +352,14 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 		t.Fatalf("expected 1 head workload, got %d", len(heads))
 	}
 
+	// 1. Cold Snapshot (Cycle 1, un-cached)
+	tColdStart := time.Now()
+	if _, err := sched.cache.Snapshot(ctx); err != nil {
+		t.Fatalf("cold Snapshot failed: %v", err)
+	}
+	coldSnapDur := time.Since(tColdStart)
+
+	// Warm Snapshot (Cycle 2, hits virtual pod cache)
 	tSnapStart := time.Now()
 	snapshot, err := sched.cache.Snapshot(ctx)
 	if err != nil {
@@ -372,11 +381,12 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 	}
 
 	return deterministicCycleMetrics{
-		snapshotDuration:   snapDur,
-		nominationDuration: nomDur,
-		decisionDuration:   snapDur + nomDur,
-		preemptedCount:     len(e.preemptionTargets),
-		admitted:           len(e.preemptionTargets) > 0,
+		coldSnapshotDuration: coldSnapDur,
+		snapshotDuration:     snapDur,
+		nominationDuration:   nomDur,
+		decisionDuration:     snapDur + nomDur,
+		preemptedCount:       len(e.preemptionTargets),
+		admitted:             len(e.preemptionTargets) > 0,
 	}
 }
 
@@ -781,12 +791,16 @@ func TestDeterministicTASPreemptionCycle(t *testing.T) {
 
 			t.Logf("=== %s (admitted=%d, wantVictims=%d) ===",
 				tc.name, len(tc.fix.admittedWls), tc.wantVictims)
-			t.Logf("  Classic : Snapshot=%8.2fms | Nomination=%8.2fms | Decision=%8.2fms | Victims=%d",
+			t.Logf("  Classic          : Snapshot=%8.2fms | Nomination=%8.2fms | Decision=%8.2fms | Victims=%d",
 				float64(classic.snapshotDuration.Microseconds())/1000.0,
 				float64(classic.nominationDuration.Microseconds())/1000.0,
 				float64(classic.decisionDuration.Microseconds())/1000.0,
 				classic.preemptedCount)
-			t.Logf("  DeepWAS : Snapshot=%8.2fms | Nomination=%8.2fms | Decision=%8.2fms | Victims=%d",
+			t.Logf("  DeepWAS (Baseline): Snapshot=%8.2fms | Nomination=%8.2fms | Decision=%8.2fms",
+				float64(deepWAS.coldSnapshotDuration.Microseconds())/1000.0,
+				float64(deepWAS.nominationDuration.Microseconds())/1000.0,
+				float64((deepWAS.coldSnapshotDuration+deepWAS.nominationDuration).Microseconds())/1000.0)
+			t.Logf("  DeepWAS (Cached)  : Snapshot=%8.2fms | Nomination=%8.2fms | Decision=%8.2fms | Victims=%d",
 				float64(deepWAS.snapshotDuration.Microseconds())/1000.0,
 				float64(deepWAS.nominationDuration.Microseconds())/1000.0,
 				float64(deepWAS.decisionDuration.Microseconds())/1000.0,
@@ -798,30 +812,50 @@ func TestDeterministicTASPreemptionCycle(t *testing.T) {
 }
 
 func BenchmarkDeterministicTASPreemptionCycle(b *testing.B) {
-	fix := buildDeterministicPreemptionFixture(680, 2, false)
-	for _, enableDeepWAS := range []bool{false, true} {
-		mode := "Classic"
-		if enableDeepWAS {
-			mode = "DeepWAS"
-		}
-		b.Run(mode, func(b *testing.B) {
-			setDeterministicFeatureGates(b, enableDeepWAS)
+	benchmarkDeterministicTASPreemptionCycleWithFixture(b, buildDeterministicPreemptionFixture(680, 2, false), 60)
+}
+
+func BenchmarkDeterministicTASPreemptionCycle2048Nodes(b *testing.B) {
+	benchmarkDeterministicTASPreemptionCycleWithFixture(b, buildAllCandidatesVictims2048NodesFixture(800, 25000, 131072), 800)
+}
+
+func benchmarkDeterministicTASPreemptionCycleWithFixture(b *testing.B, fix deterministicPreemptionFixture, wantVictims int) {
+	modes := []struct {
+		name          string
+		enableDeepWAS bool
+		warmup        bool
+	}{
+		{name: "Classic", enableDeepWAS: false, warmup: false},
+		{name: "DeepWAS-Baseline", enableDeepWAS: true, warmup: false},
+		{name: "DeepWAS-Cached", enableDeepWAS: true, warmup: true},
+	}
+	for _, m := range modes {
+		b.Run(m.name, func(b *testing.B) {
+			setDeterministicFeatureGates(b, m.enableDeepWAS)
 			log := logr.Discard()
 			ctx := ctrl.LoggerInto(b.Context(), log)
-			var simFactoryOpts []schdcache.Option
-			if enableDeepWAS {
+			var sharedSimFactoryOpts []schdcache.Option
+			if m.enableDeepWAS && m.warmup {
 				simFactory, err := was.NewWASSimulatorFactory(ctx, nil)
 				if err != nil {
 					b.Fatal(err)
 				}
-				simFactoryOpts = append(simFactoryOpts, schdcache.WithSimulatorFactory(simFactory))
+				sharedSimFactoryOpts = append(sharedSimFactoryOpts, schdcache.WithSimulatorFactory(simFactory))
 			}
 
-			for b.Loop() {
+			for i := 0; i < b.N; i++ {
 				b.StopTimer()
+				iterSimFactoryOpts := sharedSimFactoryOpts
+				if m.enableDeepWAS && !m.warmup {
+					simFactory, err := was.NewWASSimulatorFactory(ctx, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					iterSimFactoryOpts = []schdcache.Option{schdcache.WithSimulatorFactory(simFactory)}
+				}
 				objs := []client.Object{utiltesting.MakeNamespaceWrapper(detNamespace).Obj(), fix.topology}
-				for i := range fix.nodes {
-					objs = append(objs, &fix.nodes[i])
+				for j := range fix.nodes {
+					objs = append(objs, &fix.nodes[j])
 				}
 				cb := utiltesting.NewClientBuilder().
 					WithObjects(objs...).
@@ -834,7 +868,7 @@ func BenchmarkDeterministicTASPreemptionCycle(b *testing.B) {
 					WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType)
 				cl := cb.Build()
 				recorder := &utiltesting.EventRecorder{}
-				cqCache := schdcache.New(cl, simFactoryOpts...)
+				cqCache := schdcache.New(cl, iterSimFactoryOpts...)
 				expStore := preemptexpectations.New()
 				qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithPreemptionExpectations(expStore))
 				cqCache.AddOrUpdateTopology(log, fix.topology)
@@ -842,15 +876,22 @@ func BenchmarkDeterministicTASPreemptionCycle(b *testing.B) {
 				_ = cqCache.AddClusterQueue(ctx, fix.cq)
 				_ = qManager.AddClusterQueue(ctx, fix.cq)
 				_ = qManager.AddLocalQueue(ctx, fix.lq)
-				for i := range fix.nodes {
-					cqCache.TASCache().SyncNode(&fix.nodes[i])
+				for j := range fix.nodes {
+					cqCache.TASCache().SyncNode(&fix.nodes[j])
 				}
-				for i := range fix.admittedWls {
-					cqCache.AddOrUpdateWorkload(ctx, log, &fix.admittedWls[i])
+				for j := range fix.admittedWls {
+					cqCache.AddOrUpdateWorkload(ctx, log, &fix.admittedWls[j])
 				}
 				_ = qManager.AddOrUpdateWorkload(ctx, log, fix.incomingWl.DeepCopy())
 				sched := New(qManager, cqCache, cl, recorder, WithPreemptionExpectations(expStore))
 				heads := sched.queues.Heads(ctx)
+
+				if m.warmup {
+					// Warm up cache so the timed loop measures steady state.
+					if _, err := sched.cache.Snapshot(ctx); err != nil {
+						b.Fatal(err)
+					}
+				}
 
 				b.StartTimer()
 				snapshot, err := sched.cache.Snapshot(ctx)
@@ -860,8 +901,8 @@ func BenchmarkDeterministicTASPreemptionCycle(b *testing.B) {
 				entries, _ := sched.nominate(ctx, heads, snapshot)
 				b.StopTimer()
 
-				if len(entries) != 1 || len(entries[0].preemptionTargets) != 60 {
-					b.Fatalf("unexpected victims: %d", len(entries[0].preemptionTargets))
+				if len(entries) != 1 || len(entries[0].preemptionTargets) != wantVictims {
+					b.Fatalf("unexpected victims: %d (want %d)", len(entries[0].preemptionTargets), wantVictims)
 				}
 			}
 		})
