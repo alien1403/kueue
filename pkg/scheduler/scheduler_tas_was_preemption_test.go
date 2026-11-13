@@ -18,7 +18,15 @@ package scheduler
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	"os"
+	"path/filepath"
+	goruntime "runtime"
+	"runtime/pprof"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,13 +64,16 @@ const (
 )
 
 type deterministicPreemptionFixture struct {
-	topology    *kueue.Topology
-	flavor      *kueue.ResourceFlavor
-	cq          *kueue.ClusterQueue
-	lq          *kueue.LocalQueue
-	nodes       []corev1.Node
-	admittedWls []kueue.Workload
-	incomingWl  *kueue.Workload
+	topology         *kueue.Topology
+	flavor           *kueue.ResourceFlavor
+	cq               *kueue.ClusterQueue
+	lq               *kueue.LocalQueue
+	extraCQs         []kueue.ClusterQueue
+	extraLQs         []kueue.LocalQueue
+	nodes            []corev1.Node
+	admittedWls      []kueue.Workload
+	incomingWl       *kueue.Workload
+	extraIncomingWls []*kueue.Workload
 }
 
 // buildDeterministicPreemptionFixture constructs the exact 24-node (4 racks x 6 nodes, 8 CPU/node = 192 CPU),
@@ -261,16 +272,48 @@ func setDeterministicFeatureGates(tb testing.TB, enableDeepWAS bool) {
 	})
 }
 
+type phaseMemStats struct {
+	allocBytes uint64
+	mallocs    uint64
+	numGC      uint32
+}
+
+func measureMemStats[T any](fn func() T) (T, phaseMemStats) {
+	var before, after goruntime.MemStats
+	goruntime.ReadMemStats(&before)
+	res := fn()
+	goruntime.ReadMemStats(&after)
+	return res, phaseMemStats{
+		allocBytes: after.TotalAlloc - before.TotalAlloc,
+		mallocs:    after.Mallocs - before.Mallocs,
+		numGC:      after.NumGC - before.NumGC,
+	}
+}
+
 type deterministicCycleMetrics struct {
 	coldSnapshotDuration time.Duration
 	snapshotDuration     time.Duration
 	nominationDuration   time.Duration
 	decisionDuration     time.Duration
+	coldSnapMem          phaseMemStats
+	snapMem              phaseMemStats
+	nomMem               phaseMemStats
 	preemptedCount       int
 	admitted             bool
 }
 
+type cycleRunOpts struct {
+	skipColdSnapshot bool
+	cpuProfPath      string
+	memProfPath      string
+}
+
 func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, enableDeepWAS bool) deterministicCycleMetrics {
+	t.Helper()
+	return runSinglePreemptionCycleWithOpts(t, fix, enableDeepWAS, cycleRunOpts{})
+}
+
+func runSinglePreemptionCycleWithOpts(t testing.TB, fix deterministicPreemptionFixture, enableDeepWAS bool, opts cycleRunOpts) deterministicCycleMetrics {
 	t.Helper()
 	setDeterministicFeatureGates(t, enableDeepWAS)
 
@@ -285,12 +328,20 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 		objs = append(objs, &fix.nodes[i])
 	}
 
+	cqs := make([]kueue.ClusterQueue, 0, 1+len(fix.extraCQs))
+	cqs = append(cqs, *fix.cq)
+	cqs = append(cqs, fix.extraCQs...)
+
+	lqs := make([]kueue.LocalQueue, 0, 1+len(fix.extraLQs))
+	lqs = append(lqs, *fix.lq)
+	lqs = append(lqs, fix.extraLQs...)
+
 	cb := utiltesting.NewClientBuilder().
 		WithObjects(objs...).
 		WithLists(
 			&kueue.WorkloadList{Items: fix.admittedWls},
-			&kueue.LocalQueueList{Items: []kueue.LocalQueue{*fix.lq}},
-			&kueue.ClusterQueueList{Items: []kueue.ClusterQueue{*fix.cq}},
+			&kueue.LocalQueueList{Items: lqs},
+			&kueue.ClusterQueueList{Items: cqs},
 		).
 		WithStatusSubresource(&kueue.Workload{}).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -320,14 +371,18 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 
 	cqCache.AddOrUpdateTopology(log, fix.topology)
 	cqCache.AddOrUpdateResourceFlavor(log, fix.flavor)
-	if err := cqCache.AddClusterQueue(ctx, fix.cq); err != nil {
-		t.Fatalf("adding ClusterQueue to cqCache: %v", err)
+	for i := range cqs {
+		if err := cqCache.AddClusterQueue(ctx, &cqs[i]); err != nil {
+			t.Fatalf("adding ClusterQueue %s to cqCache: %v", cqs[i].Name, err)
+		}
+		if err := qManager.AddClusterQueue(ctx, &cqs[i]); err != nil {
+			t.Fatalf("adding ClusterQueue %s to qManager: %v", cqs[i].Name, err)
+		}
 	}
-	if err := qManager.AddClusterQueue(ctx, fix.cq); err != nil {
-		t.Fatalf("adding ClusterQueue to qManager: %v", err)
-	}
-	if err := qManager.AddLocalQueue(ctx, fix.lq); err != nil {
-		t.Fatalf("adding LocalQueue to qManager: %v", err)
+	for i := range lqs {
+		if err := qManager.AddLocalQueue(ctx, &lqs[i]); err != nil {
+			t.Fatalf("adding LocalQueue %s to qManager: %v", lqs[i].Name, err)
+		}
 	}
 	for i := range fix.nodes {
 		cqCache.TASCache().SyncNode(&fix.nodes[i])
@@ -342,42 +397,117 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 	if err := qManager.AddOrUpdateWorkload(ctx, log, incomingCopy); err != nil {
 		t.Fatalf("adding incoming workload to qManager: %v", err)
 	}
+	for _, extraWl := range fix.extraIncomingWls {
+		if err := qManager.AddOrUpdateWorkload(ctx, log, extraWl.DeepCopy()); err != nil {
+			t.Fatalf("adding extra incoming workload %s to qManager: %v", extraWl.Name, err)
+		}
+	}
 
 	sched := New(qManager, cqCache, cl, recorder, WithPreemptionExpectations(expStore))
 
 	// Execute the exact two in-memory phases of scheduler.schedule(ctx):
 	// 1. Pop heads & take Snapshot
 	heads := sched.queues.Heads(ctx)
-	if len(heads) != 1 {
-		t.Fatalf("expected 1 head workload, got %d", len(heads))
+	wantHeads := 1 + len(fix.extraIncomingWls)
+	if len(heads) != wantHeads {
+		t.Fatalf("expected %d head workloads, got %d", wantHeads, len(heads))
 	}
 
-	// 1. Cold Snapshot (Cycle 1, un-cached)
-	tColdStart := time.Now()
-	if _, err := sched.cache.Snapshot(ctx); err != nil {
-		t.Fatalf("cold Snapshot failed: %v", err)
+	// 1a. Cold Snapshot (Cycle 1, un-cached)
+	var coldSnapDur time.Duration
+	var coldSnapMem phaseMemStats
+	if !opts.skipColdSnapshot {
+		var coldErr error
+		coldSnapDur, coldSnapMem = measureMemStats(func() time.Duration {
+			tStart := time.Now()
+			_, coldErr = sched.cache.Snapshot(ctx)
+			return time.Since(tStart)
+		})
+		if coldErr != nil {
+			t.Fatalf("cold Snapshot failed: %v", coldErr)
+		}
 	}
-	coldSnapDur := time.Since(tColdStart)
 
-	// Warm Snapshot (Cycle 2, hits virtual pod cache)
-	tSnapStart := time.Now()
-	snapshot, err := sched.cache.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot failed: %v", err)
+	// 1b. Warm Snapshot (Cycle 2, hits virtual pod cache)
+	type snapRes struct {
+		snap *schdcache.Snapshot
+		dur  time.Duration
+		err  error
 	}
-	snapDur := time.Since(tSnapStart)
+	sRes, snapMem := measureMemStats(func() snapRes {
+		tStart := time.Now()
+		s, err := sched.cache.Snapshot(ctx)
+		return snapRes{snap: s, dur: time.Since(tStart), err: err}
+	})
+	if sRes.err != nil {
+		t.Fatalf("Snapshot failed: %v", sRes.err)
+	}
+	snapshot := sRes.snap
+	snapDur := sRes.dur
 
 	// 2. Nominate (runs AssignAndNominate + Preemptor.GetTargets)
-	tNomStart := time.Now()
-	entries, inadmissible := sched.nominate(ctx, heads, snapshot)
-	nomDur := time.Since(tNomStart)
-
-	if len(inadmissible) > 0 || len(entries) != 1 {
-		t.Fatalf("expected 1 nominated entry and 0 inadmissible, got entries=%d inadmissible=%d", len(entries), len(inadmissible))
+	var cpuFile *os.File
+	if opts.cpuProfPath != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.cpuProfPath), 0o755); err != nil {
+			t.Fatalf("creating cpuprof dir: %v", err)
+		}
+		f, err := os.Create(opts.cpuProfPath)
+		if err != nil {
+			t.Fatalf("creating cpuprof file %s: %v", opts.cpuProfPath, err)
+		}
+		cpuFile = f
+		if err := pprof.StartCPUProfile(cpuFile); err != nil {
+			_ = cpuFile.Close()
+			t.Fatalf("starting CPU profile: %v", err)
+		}
 	}
-	e := entries[0]
-	if e.assignment.RepresentativeMode() != flavorassigner.Preempt {
-		t.Fatalf("expected RepresentativeMode() == Preempt, got %v (status=%v)", e.assignment.RepresentativeMode(), e.status)
+
+	type nomRes struct {
+		entries      []entry
+		inadmissible []entry
+		dur          time.Duration
+	}
+	nRes, nomMem := measureMemStats(func() nomRes {
+		tStart := time.Now()
+		en, inad := sched.nominate(ctx, heads, snapshot)
+		return nomRes{entries: en, inadmissible: inad, dur: time.Since(tStart)}
+	})
+
+	if cpuFile != nil {
+		pprof.StopCPUProfile()
+		_ = cpuFile.Close()
+	}
+	if opts.memProfPath != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.memProfPath), 0o755); err != nil {
+			t.Fatalf("creating memprof dir: %v", err)
+		}
+		f, err := os.Create(opts.memProfPath)
+		if err != nil {
+			t.Fatalf("creating memprof file %s: %v", opts.memProfPath, err)
+		}
+		goruntime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			_ = f.Close()
+			t.Fatalf("writing heap profile: %v", err)
+		}
+		_ = f.Close()
+	}
+
+	entries, inadmissible := nRes.entries, nRes.inadmissible
+	nomDur := nRes.dur
+
+	if wantHeads == 1 {
+		if len(inadmissible) > 0 || len(entries) != 1 {
+			t.Fatalf("expected 1 nominated entry and 0 inadmissible, got entries=%d inadmissible=%d", len(entries), len(inadmissible))
+		}
+		if entries[0].assignment.RepresentativeMode() != flavorassigner.Preempt {
+			t.Fatalf("expected RepresentativeMode() == Preempt, got %v (status=%v)", entries[0].assignment.RepresentativeMode(), entries[0].status)
+		}
+	}
+
+	totalVictims := 0
+	for i := range entries {
+		totalVictims += len(entries[i].preemptionTargets)
 	}
 
 	return deterministicCycleMetrics{
@@ -385,8 +515,11 @@ func runSinglePreemptionCycle(t testing.TB, fix deterministicPreemptionFixture, 
 		snapshotDuration:     snapDur,
 		nominationDuration:   nomDur,
 		decisionDuration:     snapDur + nomDur,
-		preemptedCount:       len(e.preemptionTargets),
-		admitted:             len(e.preemptionTargets) > 0,
+		coldSnapMem:          coldSnapMem,
+		snapMem:              snapMem,
+		nomMem:               nomMem,
+		preemptedCount:       totalVictims,
+		admitted:             totalVictims > 0,
 	}
 }
 
@@ -908,3 +1041,716 @@ func benchmarkDeterministicTASPreemptionCycleWithFixture(b *testing.B, fix deter
 		})
 	}
 }
+
+type GenericFixtureParams struct {
+	NumRacks         int
+	NodesPerRack     int
+	CPUPerNode       int
+	NumCandidates    int
+	PodsPerWorkload  int
+	PodMilliCPU      int
+	TargetUtilPct    int    // default 80
+	TASMode          string // "required", "balanced"
+	QuotaRegime      string // "exact", "spare", "spare_20%", "node_bound"
+	PreemptorScope   string // "single_node", "single_rack", "half_cluster", "all_cluster"
+	SpreadCandidates bool
+	OverlapHeads     bool // if true, uses 2 CQs in a cohort with 2 overlapping heads to exercise committedVictims
+}
+
+func buildGenericDeterministicFixture(p GenericFixtureParams) (deterministicPreemptionFixture, int) {
+	if p.NumRacks <= 0 {
+		p.NumRacks = 4
+	}
+	if p.NodesPerRack <= 0 {
+		p.NodesPerRack = 6
+	}
+	if p.CPUPerNode <= 0 {
+		if p.NumRacks*p.NodesPerRack >= 100 {
+			p.CPUPerNode = 64
+		} else {
+			p.CPUPerNode = 8
+		}
+	}
+	if p.PodsPerWorkload <= 0 {
+		p.PodsPerWorkload = 2
+	}
+	if p.TargetUtilPct <= 0 {
+		p.TargetUtilPct = 80
+	}
+	if p.TASMode == "" {
+		p.TASMode = "required"
+	}
+
+	numNodes := p.NumRacks * p.NodesPerRack
+	totalClusterCPU := numNodes * p.CPUPerNode
+	totalClusterMilliCPU := totalClusterCPU * 1000
+
+	podMilliCPU := p.PodMilliCPU
+	if podMilliCPU <= 0 {
+		targetMilliCPU := (totalClusterMilliCPU * p.TargetUtilPct) / 100
+		podMilliCPU = targetMilliCPU / (p.NumCandidates * p.PodsPerWorkload)
+		if podMilliCPU < 1 {
+			podMilliCPU = 1
+		}
+	}
+	wlMilliCPU := p.PodsPerWorkload * podMilliCPU
+
+	maxPodsPerNode := 110
+	if needed := (p.NumCandidates*p.PodsPerWorkload)/numNodes + 100; needed > maxPodsPerNode {
+		maxPodsPerNode = needed
+	}
+
+	nodes := make([]corev1.Node, 0, numNodes)
+	rackNodes := make([][]string, p.NumRacks)
+	nodeUsedMilliCPU := make([][]int, p.NumRacks)
+	for r := range p.NumRacks {
+		nodeUsedMilliCPU[r] = make([]int, p.NodesPerRack)
+		for n := range p.NodesPerRack {
+			host := fmt.Sprintf("node-0-%d-%d", r, n)
+			rack := fmt.Sprintf("rack-%d", r)
+			rackNodes[r] = append(rackNodes[r], host)
+			node := *testingnode.MakeNode(host).
+				Label(detBlockLabel, "block-0").
+				Label(detRackLabel, rack).
+				Label(corev1.LabelHostname, host).
+				Label("tas-node-group", "true").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", p.CPUPerNode)),
+					corev1.ResourceMemory: resource.MustParse("512Gi"),
+					corev1.ResourcePods:   resource.MustParse(fmt.Sprintf("%d", maxPodsPerNode)),
+				}).
+				Ready().
+				Obj()
+			nodes = append(nodes, node)
+		}
+	}
+
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	admittedWls := make([]kueue.Workload, 0, p.NumCandidates)
+	rackRRIdx := make([]int, p.NumRacks)
+	podCPUReqStr := fmt.Sprintf("%dm", podMilliCPU)
+	wlCPUAssignStr := fmt.Sprintf("%dm", wlMilliCPU)
+
+	sliceSize := int32(max(1, p.PodsPerWorkload/2))
+	for i := range p.NumCandidates {
+		r := i % p.NumRacks
+		var nodeInRack int
+		if p.SpreadCandidates {
+			nodeInRack = rackRRIdx[r] % p.NodesPerRack
+			rackRRIdx[r]++
+		} else {
+			nodeCapMilli := p.CPUPerNode * 1000
+			found := false
+			for n := range p.NodesPerRack {
+				if nodeUsedMilliCPU[r][n]+wlMilliCPU <= nodeCapMilli {
+					nodeInRack = n
+					found = true
+					break
+				}
+			}
+			if !found {
+				nodeInRack = rackRRIdx[r] % p.NodesPerRack
+				rackRRIdx[r]++
+			}
+		}
+
+		nodeUsedMilliCPU[r][nodeInRack] += wlMilliCPU
+		host := rackNodes[r][nodeInRack]
+		admitTime := baseTime.Add(time.Duration(1000+i) * time.Millisecond)
+
+		ta := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+			Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{host}, int32(p.PodsPerWorkload)).Obj()).
+			Obj()
+		psBuilder := utiltestingapi.MakePodSet("main", p.PodsPerWorkload).
+			Request(corev1.ResourceCPU, podCPUReqStr)
+		if p.TASMode == "balanced" {
+			psBuilder = psBuilder.SliceRequiredTopologyRequest(detRackLabel).SliceSizeTopologyRequest(sliceSize)
+		} else {
+			psBuilder = psBuilder.RequiredTopologyRequest(detRackLabel)
+		}
+		ps := psBuilder.Obj()
+		psa := utiltestingapi.MakePodSetAssignment("main").
+			Assignment(corev1.ResourceCPU, detFlavorName, wlCPUAssignStr).
+			Count(int32(p.PodsPerWorkload)).
+			TopologyAssignment(ta).
+			Obj()
+		name := fmt.Sprintf("small-cand-%05d", i)
+		wl := utiltestingapi.MakeWorkload(name, detNamespace).
+			UID(types.UID(name)).
+			Queue(detLQName).
+			Priority(50).
+			PodSets(*ps).
+			ReserveQuotaAt(utiltestingapi.MakeAdmission(detCQName).PodSets(psa).Obj(), admitTime).
+			AdmittedAt(true, admitTime).
+			Obj()
+		admittedWls = append(admittedWls, *wl)
+	}
+
+	makeIncomingWl := func(name string, lqName kueue.LocalQueueName, scope string) (*kueue.Workload, int) {
+		switch scope {
+		case "single_node":
+			ps := utiltestingapi.MakePodSet("main", 1).
+				Request(corev1.ResourceCPU, fmt.Sprintf("%d", p.CPUPerNode)).
+				RequiredTopologyRequest(corev1.LabelHostname).
+				Obj()
+			wl := utiltestingapi.MakeWorkload(name, detNamespace).
+				UID(types.UID(name)).
+				Queue(lqName).
+				Priority(200).
+				PodSets(*ps).
+				Obj()
+			return wl, -1 // depends on node layout
+		case "single_rack":
+			ps := utiltestingapi.MakePodSet("main", p.NodesPerRack).
+				Request(corev1.ResourceCPU, fmt.Sprintf("%d", p.CPUPerNode)).
+				RequiredTopologyRequest(detRackLabel).
+				Obj()
+			wl := utiltestingapi.MakeWorkload(name, detNamespace).
+				UID(types.UID(name)).
+				Queue(lqName).
+				Priority(200).
+				PodSets(*ps).
+				Obj()
+			rack0Candidates := 0
+			for i := range p.NumCandidates {
+				if i%p.NumRacks == 0 {
+					rack0Candidates++
+				}
+			}
+			return wl, rack0Candidates
+		case "half_cluster":
+			halfNodes := max(1, numNodes/2)
+			ps := utiltestingapi.MakePodSet("main", halfNodes).
+				Request(corev1.ResourceCPU, fmt.Sprintf("%d", p.CPUPerNode)).
+				RequiredTopologyRequest(detBlockLabel).
+				Obj()
+			wl := utiltestingapi.MakeWorkload(name, detNamespace).
+				UID(types.UID(name)).
+				Queue(lqName).
+				Priority(200).
+				PodSets(*ps).
+				Obj()
+			return wl, -1
+		case "all_cluster":
+			fallthrough
+		default:
+			ps := utiltestingapi.MakePodSet("main", numNodes).
+				Request(corev1.ResourceCPU, fmt.Sprintf("%d", p.CPUPerNode)).
+				RequiredTopologyRequest(detBlockLabel).
+				Obj()
+			wl := utiltestingapi.MakeWorkload(name, detNamespace).
+				UID(types.UID(name)).
+				Queue(lqName).
+				Priority(200).
+				PodSets(*ps).
+				Obj()
+			return wl, p.NumCandidates
+		}
+	}
+
+	incomingWl, wantVictims := makeIncomingWl("preemptor-0", detLQName, p.PreemptorScope)
+
+	var cqNominalQuotaCPU int
+	switch p.QuotaRegime {
+	case "spare", "spare_10%":
+		cqNominalQuotaCPU = int(float64(totalClusterCPU) * 1.10)
+	case "spare_20%":
+		cqNominalQuotaCPU = int(float64(totalClusterCPU) * 1.20)
+	case "node_bound":
+		cqNominalQuotaCPU = totalClusterCPU * 2
+	case "exact":
+		fallthrough
+	default:
+		cqNominalQuotaCPU = totalClusterCPU
+	}
+
+	topology := utiltestingapi.MakeTopology(detTopoName).
+		Levels(detBlockLabel, detRackLabel, corev1.LabelHostname).
+		Obj()
+	flavor := utiltestingapi.MakeResourceFlavor(detFlavorName).
+		NodeLabel("tas-node-group", "true").
+		TopologyName(detTopoName).
+		Obj()
+
+	var cq *kueue.ClusterQueue
+	var lq *kueue.LocalQueue
+	var extraCQs []kueue.ClusterQueue
+	var extraLQs []kueue.LocalQueue
+	var extraIncomingWls []*kueue.Workload
+
+	if p.OverlapHeads {
+		halfQuota := max(1, cqNominalQuotaCPU/2)
+		fq0 := utiltestingapi.MakeFlavorQuotas(detFlavorName).
+			Resource(corev1.ResourceCPU, fmt.Sprintf("%d", halfQuota)).
+			Obj()
+		fq1 := utiltestingapi.MakeFlavorQuotas(detFlavorName).
+			Resource(corev1.ResourceCPU, fmt.Sprintf("%d", halfQuota)).
+			Obj()
+		cq = utiltestingapi.MakeClusterQueue(detCQName).
+			Cohort("cohort-0").
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			ResourceGroup(*fq0).
+			Obj()
+		lq = utiltestingapi.MakeLocalQueue(detLQName, detNamespace).
+			ClusterQueue(detCQName).
+			Obj()
+
+		cq1Name := "cq-1-0-cohort-0"
+		lq1Name := "lq-1-0-cohort-0"
+		cq1 := utiltestingapi.MakeClusterQueue(cq1Name).
+			Cohort("cohort-0").
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			ResourceGroup(*fq1).
+			Obj()
+		lq1 := utiltestingapi.MakeLocalQueue(lq1Name, detNamespace).
+			ClusterQueue(cq1Name).
+			Obj()
+		extraCQs = append(extraCQs, *cq1)
+		extraLQs = append(extraLQs, *lq1)
+
+		head1Scope := p.PreemptorScope
+		if head1Scope == "all_cluster" {
+			head1Scope = "half_cluster"
+			incomingWl, _ = makeIncomingWl("preemptor-0", detLQName, "half_cluster")
+		}
+		wl1, _ := makeIncomingWl("preemptor-1", kueue.LocalQueueName(lq1Name), head1Scope)
+		extraIncomingWls = append(extraIncomingWls, wl1)
+		wantVictims = -1 // multi-head overlap victim count is verified by Classic == DeepWAS
+	} else {
+		fq := utiltestingapi.MakeFlavorQuotas(detFlavorName).
+			Resource(corev1.ResourceCPU, fmt.Sprintf("%d", cqNominalQuotaCPU)).
+			Obj()
+		cq = utiltestingapi.MakeClusterQueue(detCQName).
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyNever,
+			}).
+			ResourceGroup(*fq).
+			Obj()
+		lq = utiltestingapi.MakeLocalQueue(detLQName, detNamespace).
+			ClusterQueue(detCQName).
+			Obj()
+	}
+
+	return deterministicPreemptionFixture{
+		topology:         topology,
+		flavor:           flavor,
+		cq:               cq,
+		lq:               lq,
+		extraCQs:         extraCQs,
+		extraLQs:         extraLQs,
+		nodes:            nodes,
+		admittedWls:      admittedWls,
+		incomingWl:       incomingWl,
+		extraIncomingWls: extraIncomingWls,
+	}, wantVictims
+}
+
+type gridResultRow struct {
+	caseName        string
+	nodes           int
+	racks           int
+	candidates      int
+	podsPerWl       int
+	tasMode         string
+	quota           string
+	spread          bool
+	scope           string
+	overlapHeads    bool
+	classicSnapMs   float64
+	classicNomMs    float64
+	classicDecMs    float64
+	classicAllocMB  float64
+	classicGC       uint32
+	wasBaseSnapMs   float64
+	wasBaseNomMs    float64
+	wasBaseDecMs    float64
+	wasBaseAllocMB  float64
+	wasBaseGC       uint32
+	wasCachedSnapMs float64
+	wasCachedNomMs  float64
+	wasCachedDecMs  float64
+	wasCachedAllocMB float64
+	wasCachedGC     uint32
+	slowdownBase    float64
+	slowdownCached  float64
+	victims         int
+}
+
+func medianCycleMetrics(runs []deterministicCycleMetrics) deterministicCycleMetrics {
+	if len(runs) == 1 {
+		return runs[0]
+	}
+	sorted := make([]deterministicCycleMetrics, len(runs))
+	copy(sorted, runs)
+	slices.SortFunc(sorted, func(a, b deterministicCycleMetrics) int {
+		if a.decisionDuration < b.decisionDuration {
+			return -1
+		}
+		if a.decisionDuration > b.decisionDuration {
+			return 1
+		}
+		return 0
+	})
+	return sorted[len(sorted)/2]
+}
+
+func parseEnvIntList(key string, def []int) []int {
+	env := os.Getenv(key)
+	if env == "" {
+		return def
+	}
+	var out []int
+	for _, s := range strings.Split(env, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+func parseEnvStrList(key string, def []string) []string {
+	env := os.Getenv(key)
+	if env == "" {
+		return def
+	}
+	var out []string
+	for _, s := range strings.Split(env, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+func parseEnvBoolList(key string, def []bool) []bool {
+	env := os.Getenv(key)
+	if env == "" {
+		return def
+	}
+	var out []bool
+	for _, s := range strings.Split(env, ",") {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "true" || s == "1" {
+			out = append(out, true)
+		} else if s == "false" || s == "0" {
+			out = append(out, false)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+func appendFileLine(path, content string) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.WriteString(content)
+}
+
+func TestDeterministicTASPreemptionGrid(t *testing.T) {
+	nodesList := parseEnvIntList("GRID_NODES", []int{24, 2048})
+	candsList := parseEnvIntList("GRID_CANDIDATES", []int{800, 2000})
+	podsPerWlList := parseEnvIntList("GRID_PODS_PER_WL", []int{2})
+	tasModesList := parseEnvStrList("GRID_TAS_MODES", []string{"required"})
+	quotasList := parseEnvStrList("GRID_QUOTAS", []string{"exact", "spare"})
+	spreadList := parseEnvBoolList("GRID_SPREAD", []bool{true})
+	preemptorList := parseEnvStrList("GRID_PREEMPTOR", []string{"all_cluster"})
+	overlapList := parseEnvBoolList("GRID_OVERLAP_HEADS", []bool{false})
+
+	targetUtilPct := 80
+	if env := os.Getenv("GRID_TARGET_UTIL"); env != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(env)); err == nil && n > 0 && n <= 100 {
+			targetUtilPct = n
+		}
+	}
+
+	repeats := 1
+	if env := os.Getenv("GRID_REPEATS"); env != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(env)); err == nil && n > 0 {
+			repeats = n
+		}
+	}
+
+	modesMap := map[string]bool{"classic": true, "was_cold": true, "was_cached": true}
+	if env := os.Getenv("GRID_MODES"); env != "" {
+		modesMap = map[string]bool{}
+		for _, m := range parseEnvStrList("GRID_MODES", nil) {
+			modesMap[m] = true
+		}
+	}
+	runClassic := modesMap["classic"]
+	runWASCold := modesMap["was_cold"]
+	runWASCached := modesMap["was_cached"]
+	runAnyWAS := runWASCold || runWASCached
+
+	pprofDir := os.Getenv("GRID_PPROF_DIR")
+	outMD := os.Getenv("GRID_OUTPUT_MD")
+	outCSV := os.Getenv("GRID_OUTPUT_CSV")
+
+	mdHeader := "### Deterministic TAS Preemption Grid Search Results\n\n" +
+		"| Scenario | Mode | Snapshot | Nomination | Decision | Alloc (Snap+Nom) | GC | Slowdown | Victims |\n" +
+		"| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n"
+	if outMD != "" {
+		if err := os.MkdirAll(filepath.Dir(outMD), 0o755); err == nil {
+			_ = os.WriteFile(outMD, []byte(mdHeader), 0o644)
+		}
+	}
+
+	var csvWriter *csv.Writer
+	var csvFile *os.File
+	if outCSV != "" {
+		if err := os.MkdirAll(filepath.Dir(outCSV), 0o755); err == nil {
+			if f, err := os.Create(outCSV); err == nil {
+				csvFile = f
+				csvWriter = csv.NewWriter(f)
+				_ = csvWriter.Write([]string{
+					"case", "nodes", "racks", "candidates", "pods_per_wl", "tas_mode", "quota", "layout", "scope", "overlap_heads",
+					"classic_snap_ms", "classic_nom_ms", "classic_dec_ms", "classic_alloc_mb", "classic_gc",
+					"was_cold_snap_ms", "was_cold_nom_ms", "was_cold_dec_ms", "was_cold_alloc_mb", "was_cold_gc",
+					"was_cached_snap_ms", "was_cached_nom_ms", "was_cached_dec_ms", "was_cached_alloc_mb", "was_cached_gc",
+					"slowdown_cold", "slowdown_cached", "victims",
+				})
+				csvWriter.Flush()
+			}
+		}
+	}
+	if csvFile != nil {
+		defer func() {
+			csvWriter.Flush()
+			_ = csvFile.Close()
+		}()
+	}
+
+	var results []gridResultRow
+
+	for _, nodes := range nodesList {
+		numRacks := 4
+		nodesPerRack := nodes / numRacks
+		if nodesPerRack == 0 {
+			numRacks = 1
+			nodesPerRack = nodes
+		}
+
+		for _, cands := range candsList {
+			for _, podsPerWl := range podsPerWlList {
+				for _, tasMode := range tasModesList {
+					for _, quota := range quotasList {
+						for _, spread := range spreadList {
+							for _, scope := range preemptorList {
+								for _, overlap := range overlapList {
+									params := GenericFixtureParams{
+										NumRacks:         numRacks,
+										NodesPerRack:     nodesPerRack,
+										NumCandidates:    cands,
+										PodsPerWorkload:  podsPerWl,
+										TargetUtilPct:    targetUtilPct,
+										TASMode:          tasMode,
+										QuotaRegime:      quota,
+										PreemptorScope:   scope,
+										SpreadCandidates: spread,
+										OverlapHeads:     overlap,
+									}
+									layoutName := "Spread"
+									if !spread {
+										layoutName = "Packed"
+									}
+									overlapTag := ""
+									if overlap {
+										overlapTag = "_Overlap"
+									}
+									caseName := fmt.Sprintf("%dNodes_%dCands_%dPods_%s_%sQuota_%s_%s%s",
+										nodes, cands, podsPerWl, tasMode, quota, layoutName, scope, overlapTag)
+
+									t.Run(caseName, func(t *testing.T) {
+										fix, wantVictims := buildGenericDeterministicFixture(params)
+
+										var classic, deepWAS deterministicCycleMetrics
+										if runClassic {
+											runs := make([]deterministicCycleMetrics, 0, repeats)
+											for r := range repeats {
+												opts := cycleRunOpts{skipColdSnapshot: true}
+												if pprofDir != "" && r == repeats-1 {
+													opts.cpuProfPath = filepath.Join(pprofDir, caseName+"_classic_nom.cpu.prof")
+													opts.memProfPath = filepath.Join(pprofDir, caseName+"_classic_nom.mem.prof")
+												}
+												runs = append(runs, runSinglePreemptionCycleWithOpts(t, fix, false, opts))
+											}
+											classic = medianCycleMetrics(runs)
+										}
+										if runAnyWAS {
+											runs := make([]deterministicCycleMetrics, 0, repeats)
+											for r := range repeats {
+												opts := cycleRunOpts{skipColdSnapshot: !runWASCold}
+												if pprofDir != "" && r == repeats-1 {
+													opts.cpuProfPath = filepath.Join(pprofDir, caseName+"_deepwas_nom.cpu.prof")
+													opts.memProfPath = filepath.Join(pprofDir, caseName+"_deepwas_nom.mem.prof")
+												}
+												runs = append(runs, runSinglePreemptionCycleWithOpts(t, fix, true, opts))
+											}
+											deepWAS = medianCycleMetrics(runs)
+										}
+
+										if runClassic && runAnyWAS {
+											if wantVictims >= 0 && params.PreemptorScope != "single_rack" {
+												if classic.preemptedCount != wantVictims {
+													t.Errorf("Classic preempted = %d, want %d", classic.preemptedCount, wantVictims)
+												}
+												if deepWAS.preemptedCount != wantVictims {
+													t.Errorf("DeepWAS preempted = %d, want %d", deepWAS.preemptedCount, wantVictims)
+												}
+											} else if classic.preemptedCount != deepWAS.preemptedCount {
+												t.Logf("Note: victim count differs (Classic=%d, DeepWAS=%d)", classic.preemptedCount, deepWAS.preemptedCount)
+											}
+										}
+
+										ms := func(d time.Duration) float64 {
+											return float64(d.Microseconds()) / 1000.0
+										}
+										mb := func(b uint64) float64 {
+											return float64(b) / (1024.0 * 1024.0)
+										}
+
+										cSnap, cNom, cDec := ms(classic.snapshotDuration), ms(classic.nominationDuration), ms(classic.decisionDuration)
+										cAlloc := mb(classic.snapMem.allocBytes + classic.nomMem.allocBytes)
+										cGC := classic.snapMem.numGC + classic.nomMem.numGC
+
+										wColdSnap := ms(deepWAS.coldSnapshotDuration)
+										wNom := ms(deepWAS.nominationDuration)
+										wColdDec := ms(deepWAS.coldSnapshotDuration + deepWAS.nominationDuration)
+										wColdAlloc := mb(deepWAS.coldSnapMem.allocBytes + deepWAS.nomMem.allocBytes)
+										wColdGC := deepWAS.coldSnapMem.numGC + deepWAS.nomMem.numGC
+
+										wCachedSnap := ms(deepWAS.snapshotDuration)
+										wCachedDec := ms(deepWAS.decisionDuration)
+										wCachedAlloc := mb(deepWAS.snapMem.allocBytes + deepWAS.nomMem.allocBytes)
+										wCachedGC := deepWAS.snapMem.numGC + deepWAS.nomMem.numGC
+
+										var slowdownCold, slowdownCached float64
+										if cDec > 0 {
+											slowdownCold = wColdDec / cDec
+											slowdownCached = wCachedDec / cDec
+										}
+
+										victims := deepWAS.preemptedCount
+										if runClassic {
+											victims = classic.preemptedCount
+										}
+
+										row := gridResultRow{
+											caseName:         caseName,
+											nodes:            nodes,
+											racks:            numRacks,
+											candidates:       cands,
+											podsPerWl:        podsPerWl,
+											tasMode:          tasMode,
+											quota:            quota,
+											spread:           spread,
+											scope:            scope,
+											overlapHeads:     overlap,
+											classicSnapMs:    cSnap,
+											classicNomMs:     cNom,
+											classicDecMs:     cDec,
+											classicAllocMB:   cAlloc,
+											classicGC:        cGC,
+											wasBaseSnapMs:    wColdSnap,
+											wasBaseNomMs:     wNom,
+											wasBaseDecMs:     wColdDec,
+											wasBaseAllocMB:   wColdAlloc,
+											wasBaseGC:        wColdGC,
+											wasCachedSnapMs:  wCachedSnap,
+											wasCachedNomMs:   wNom,
+											wasCachedDecMs:   wCachedDec,
+											wasCachedAllocMB: wCachedAlloc,
+											wasCachedGC:      wCachedGC,
+											slowdownBase:     slowdownCold,
+											slowdownCached:   slowdownCached,
+											victims:          victims,
+										}
+										results = append(results, row)
+
+										scenarioStr := fmt.Sprintf("%d nodes, %d cands (%dp, %s), %s quota, %s, %s%s",
+											nodes, cands, podsPerWl, tasMode, quota, layoutName, scope, overlapTag)
+
+										var rowMD strings.Builder
+										firstRow := true
+										if runClassic {
+											rowMD.WriteString(fmt.Sprintf("| **%s** | **Classic** | %.2f ms | %.2f ms | %.2f ms | %.1f MB | %d | 1.0x | %d |\n",
+												scenarioStr, cSnap, cNom, cDec, cAlloc, cGC, classic.preemptedCount))
+											firstRow = false
+										}
+										if runWASCold {
+											label := ""
+											if firstRow {
+												label = "**" + scenarioStr + "**"
+												firstRow = false
+											}
+											rowMD.WriteString(fmt.Sprintf("| %s | **DeepWAS (Cold)** | %.2f ms | %.2f ms | %.2f ms | %.1f MB | %d | **%.1fx** | %d |\n",
+												label, wColdSnap, wNom, wColdDec, wColdAlloc, wColdGC, slowdownCold, deepWAS.preemptedCount))
+										}
+										if runWASCached {
+											label := ""
+											if firstRow {
+												label = "**" + scenarioStr + "**"
+											}
+											rowMD.WriteString(fmt.Sprintf("| %s | **DeepWAS (Cached)** | %.2f ms | %.2f ms | %.2f ms | %.1f MB | %d | **%.1fx** | %d |\n",
+												label, wCachedSnap, wNom, wCachedDec, wCachedAlloc, wCachedGC, slowdownCached, deepWAS.preemptedCount))
+										}
+
+										if outMD != "" {
+											appendFileLine(outMD, rowMD.String())
+										}
+										if csvWriter != nil {
+											_ = csvWriter.Write([]string{
+												caseName, strconv.Itoa(nodes), strconv.Itoa(numRacks), strconv.Itoa(cands),
+												strconv.Itoa(podsPerWl), tasMode, quota, layoutName, scope, strconv.FormatBool(overlap),
+												fmt.Sprintf("%.2f", cSnap), fmt.Sprintf("%.2f", cNom), fmt.Sprintf("%.2f", cDec), fmt.Sprintf("%.2f", cAlloc), strconv.FormatUint(uint64(cGC), 10),
+												fmt.Sprintf("%.2f", wColdSnap), fmt.Sprintf("%.2f", wNom), fmt.Sprintf("%.2f", wColdDec), fmt.Sprintf("%.2f", wColdAlloc), strconv.FormatUint(uint64(wColdGC), 10),
+												fmt.Sprintf("%.2f", wCachedSnap), fmt.Sprintf("%.2f", wNom), fmt.Sprintf("%.2f", wCachedDec), fmt.Sprintf("%.2f", wCachedAlloc), strconv.FormatUint(uint64(wCachedGC), 10),
+												fmt.Sprintf("%.2f", slowdownCold), fmt.Sprintf("%.2f", slowdownCached), strconv.Itoa(victims),
+											})
+											csvWriter.Flush()
+										}
+
+										t.Logf("[%s] (victims=%d, repeats=%d)\n"+
+											"  Classic          : Snap=%8.2fms | Nom=%8.2fms | Dec=%8.2fms | Alloc=%6.1fMB | GC=%d\n"+
+											"  DeepWAS (Cold)   : Snap=%8.2fms | Nom=%8.2fms | Dec=%8.2fms | Alloc=%6.1fMB | GC=%d (Slowdown: %5.1fx)\n"+
+											"  DeepWAS (Cached) : Snap=%8.2fms | Nom=%8.2fms | Dec=%8.2fms | Alloc=%6.1fMB | GC=%d (Slowdown: %5.1fx)",
+											caseName, victims, repeats,
+											cSnap, cNom, cDec, cAlloc, cGC,
+											wColdSnap, wNom, wColdDec, wColdAlloc, wColdGC, slowdownCold,
+											wCachedSnap, wNom, wCachedDec, wCachedAlloc, wCachedGC, slowdownCached)
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if outMD != "" {
+		if data, err := os.ReadFile(outMD); err == nil {
+			t.Log("\n" + string(data))
+		}
+	}
+}
+

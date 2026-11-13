@@ -1043,3 +1043,17 @@ test-e2e-kueueviz: test-kueueviz-backend setup-e2e-env ## Run end-to-end tests f
 .PHONY: verify-ci-build-times
 verify-ci-build-times: ## Verify that CI build times are below threshold.
 	python3 ./hack/tools/prow-runtimes/prow_runtimes.py --kueue-presubmits --limit 5 --only-success --only-merge-pool --threshold-stat=second_longest --threshold 14m
+
+.PHONY: perf-tas-preemption-grid
+perf-tas-preemption-grid: ## Run full TAS preemption parameter grid search across nodes, candidates, and quotas.
+	./hack/run-tas-preemption-grid.sh
+
+.PHONY: perf-tas-preemption-grid-2k
+perf-tas-preemption-grid-2k: ## Run TAS preemption parameter grid search on 2,048 nodes only.
+	./hack/run-tas-preemption-grid.sh --2k
+
+.PHONY: perf-tas-preemption-grid-all
+perf-tas-preemption-grid-all: ## Run EVERY combination across nodes, candidates, quotas, layouts, and scopes.
+	./hack/run-tas-preemption-grid.sh --all
+
+
